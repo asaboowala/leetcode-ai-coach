@@ -24,7 +24,6 @@ load_dotenv()
 
 # OpenAI API Key
 openai_key = os.environ.get('OPENAI_API_KEY')
-langchain_key = os.environ.get('LANGCHAIN_API_KEY')
 tavily_key = os.environ.get('TAVILY_API_KEY')
 
 
