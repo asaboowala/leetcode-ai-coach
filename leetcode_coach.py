@@ -22,13 +22,13 @@ from termcolor import colored
 # Load environment variables
 load_dotenv()
 
-# OpenAI API Key
+# API Keys
 openai_key = os.environ.get('OPENAI_API_KEY')
 tavily_key = os.environ.get('TAVILY_API_KEY')
 
-
+# Define the graph state
 class State(TypedDict):
-    messages: Annotated[List, add_messages] = []
+    messages: Annotated[List, add_messages] = []    
     next: str = ""
 
 def resource_finder(state: State) -> Command[Literal["Supervisor"]]:
@@ -48,10 +48,11 @@ def resource_finder(state: State) -> Command[Literal["Supervisor"]]:
         Question: {query}\n"""
     )
     
-    # Bind the wrapped callable to the LLM.
+    # Define tool and bind LLM to Tavily tool
     tavily_tool = TavilySearchResults(max_results=5, search_depth="advanced", include_answer=True, include_raw_content=True)
     llm = ChatOpenAI(model="gpt-4o").bind_tools([tavily_tool])
 
+    # Define RAG chain
     rag_chain = (
         prompt
         | llm
@@ -70,7 +71,7 @@ def resource_finder(state: State) -> Command[Literal["Supervisor"]]:
     return Command(
         update={
             "messages": [
-                AIMessage(content=response.content, name="resource_finder")
+                AIMessage(content=response.content, name="Resource-Finder")
             ]
         },
         goto="Supervisor",
@@ -85,9 +86,6 @@ def coding_problem_generator(state: State) -> Command[Literal["Supervisor"]]:
 
     # Using Leetcode dataset for RAG to generate coding problems
     coding_dataset = "leetcode_dataset - lc.csv"
-
-    # Define LLM model
-    llm = ChatOpenAI(model="gpt-4o")
 
     # Load CSV file as input document
     loader = CSVLoader(file_path=coding_dataset)
@@ -115,6 +113,9 @@ def coding_problem_generator(state: State) -> Command[Literal["Supervisor"]]:
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
     
+    # Define LLM model
+    llm = ChatOpenAI(model="gpt-4o")
+    
     # Build RAG chain using retriever, prompt, and LLM
     rag_chain = (
         {"context": retriever | format_docs}
@@ -130,7 +131,7 @@ def coding_problem_generator(state: State) -> Command[Literal["Supervisor"]]:
     return Command(
         update={
             "messages": [
-                AIMessage(content=response, name="problem_generator")
+                AIMessage(content=response, name="Problem-Generator")
             ]
         },
         goto="Supervisor",
@@ -211,21 +212,17 @@ def main():
             break
 
         input_state = {"messages": [{"role": "user", "content": user_message}]}
-        config = {"configurable": {"thread_id": 42}}
 
-        # # Verbose output
-        # for event in graph.stream(input_state, config):
-        #     print(colored(event, "red"))
-        #     print("------------------------------------")
+        # Verbose output
+        for event in graph.stream(input_state):
+            print(colored(event, "red"))
+            print("------------------------------------")
 
-        # Concise output
-        final_state = graph.invoke(input_state, config)
-        print(colored(final_state["messages"][-1].content, "red"))
-        print("------------------------------------")
+        # # Concise output
+        # final_state = graph.invoke(input_state, config)
+        # print(colored(final_state["messages"][-1].content, "red"))
+        # print("------------------------------------")
 
 
 if __name__ == "__main__":
     main()
- 
-
-
