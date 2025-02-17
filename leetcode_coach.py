@@ -1,35 +1,25 @@
 import os
 from dotenv import load_dotenv
-import functools
-import operator
-from typing import Sequence, TypedDict, Annotated, Literal
-from pydantic import BaseModel
-
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_experimental.tools import PythonREPLTool
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
-from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
-from langchain_openai import ChatOpenAI
-
+from typing import TypedDict, Literal
+from typing import Annotated, List
 from langgraph.graph import END, StateGraph, START
-from langchain.tools import tool
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders.csv_loader import CSVLoader
-from langchain_community.vectorstores import Chroma
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import MessagesState
 from langgraph.types import Command
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig, chain
 
-from colorama import init
+
 from termcolor import colored
 
-init()
- 
-
+# Load environment variables
 load_dotenv()
 
 # OpenAI API Key
@@ -37,26 +27,62 @@ openai_key = os.environ.get('OPENAI_API_KEY')
 langchain_key = os.environ.get('LANGCHAIN_API_KEY')
 tavily_key = os.environ.get('TAVILY_API_KEY')
 
-# Define required tools
-tavily_tool = TavilySearchResults(max_results=5)
-python_repl_tool = PythonREPLTool()
 
-# Define LLM model
-llm = ChatOpenAI(model="gpt-4o")
+class State(TypedDict):
+    messages: Annotated[List, add_messages] = []
+    next: str = ""
 
-members = ["Resource-Finder", "Problem-Generator", "Grader"]
-options = members + ["FINISH"]
-system_prompt = (
-        "You are a supervisor tasked with managing a conversation between the"
-        " following workers:  {members}. Given the following user request,"
-        " respond with the worker to act next. Each worker will perform a"
-        " task and respond with their results and status. When finished,"
-        " respond with FINISH."
+def resource_finder(state: State) -> Command[Literal["Supervisor"]]:
+    """Finds resources based on the user's query."""
+
+    query = state["messages"][-1].content
+    context = state["messages"]
+
+    # Define prompt
+    prompt = ChatPromptTemplate.from_template(
+        f"""You are a computer science resource finder. 
+        You will find resources for the user based on their preferences 
+        in the field of computer science and related topics. 
+        Use the context to help you build the response. You may also answer
+        general questions or miscellaneous queries.
+        
+        Question: {query}\n"""
+    )
+    
+    # Bind the wrapped callable to the LLM.
+    tavily_tool = TavilySearchResults(max_results=5, search_depth="advanced", include_answer=True, include_raw_content=True)
+    llm = ChatOpenAI(model="gpt-4o").bind_tools([tavily_tool])
+
+    rag_chain = (
+        prompt
+        | llm
     )
 
-@tool
-def coding_problem_generator(query: str) -> str:
+    @chain
+    def tool_chain(user_input: str, config: RunnableConfig):
+        input_ = {"user_input": user_input, "context": context}
+        ai_msg = rag_chain.invoke(input_, config=config)
+        tool_msgs = tavily_tool.batch(ai_msg.tool_calls, config=config)
+        return rag_chain.invoke({**input_, "messages": [ai_msg, *tool_msgs]}, config=config)
+
+    response = tool_chain.invoke(query)
+
+
+    return Command(
+        update={
+            "messages": [
+                AIMessage(content=response.content, name="resource_finder")
+            ]
+        },
+        goto="Supervisor",
+    )
+
+
+
+def coding_problem_generator(state: State) -> Command[Literal["Supervisor"]]:
     """Generates a coding problem based on the user's query."""
+
+    query = state["messages"][-1].content
 
     # Using Leetcode dataset for RAG to generate coding problems
     coding_dataset = "leetcode_dataset - lc.csv"
@@ -77,153 +103,103 @@ def coding_problem_generator(query: str) -> str:
     retriever = vectorstore.as_retriever()
 
     # Define prompt
-    prompt = PromptTemplate(
-                input_variables=['context', 'question'], 
+    prompt = ChatPromptTemplate.from_template(
+        """"You are a Leetcode-style coding problem generator. 
+        You will generate a coding problem for the user to solve 
+        based on their preferences. Use the context to help you build the problem.
+        Do not provide a solution to the problem unless asked for.
 
-                template="""You are a Leetcode-style coding problem generator. 
-                You will generate a coding problem for the user to solve 
-                based on their preferences. Use the context to help you build the problem.
-                Do not provide a solution to the problem unless asked for.
-
-                Question: {question}\n 
-                Context: {context}\n 
-                Answer:"""
-                 
-            )
-
+        Context: {context}\n 
+        Answer:"""
+    )
+    
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
     
     # Build RAG chain using retriever, prompt, and LLM
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {"context": retriever | format_docs}
         | prompt
         | llm
         | StrOutputParser()
     )
 
+
     # Invoke RAG chain to generate coding problem
     response = rag_chain.invoke(query)
-
-    return response
-
-def agent_node(state: MessagesState, agent, name) -> Command[Literal["supervisor"]]:
-    result = agent.invoke(state)
 
     return Command(
         update={
             "messages": [
-                HumanMessage(content=result["messages"][-1].content, name=name)
+                AIMessage(content=response, name="problem_generator")
             ]
         },
-        goto="supervisor",
+        goto="Supervisor",
     )
 
 
-    # return {"messages": [HumanMessage(content=result["messages"][-1].content, name=name)]}
-
-
 class Router(TypedDict):
-    next: Literal[*options]
+    next: Literal["Resource-Finder", "Problem-Generator", "FINISH"]
 
 
-# # The agent state is the input to each node in the graph
-# class AgentState(TypedDict):
-#     # The annotation tells the graph that new messages will always be added to the current states
-#     messages: Annotated[Sequence[BaseMessage], operator.add]
-#     # The 'next' field indicates where to route to next
-#     next: str
+def supervisor_agent(state: State) -> Command[Literal["Resource-Finder", "Problem-Generator", "__end__"]]:
+    """Supervisor agent that manages the conversation between workers."""
 
+    question = state["messages"][-1].content
 
-def supervisor_agent(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
+    # Include the system prompt and the current conversation state in the messages
+    members = ["Resource-Finder", "Problem-Generator"]
+    system_prompt = (
+            "You are a supervisor tasked with managing a conversation between the"
+            f" following workers:  {members}. Given the following user request {question}," 
+            " respond with the worker to act next. Each worker will perform a"
+            " task and respond with their results and status. When you determine a task to be finished,"
+            " respond with FINISH."
+            " Here are the uses of each worker:\n"
+            "1. Resource-Finder: Find resources based on the user's query and handles any general or miscellaneous user queries.\n"
+            "2. Problem-Generator: Generate a coding problem based on the user's query.\n"
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
+
+    llm = ChatOpenAI(model="gpt-4o")
+
+    # Use the LLM to decide the next step
     response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
-        print("Conversation has ended!!!!!")
-        goto = END
 
-    return Command(goto=goto)
+    # Extract the next node from the response
+    next_node = response.get("next", None)
 
-    
-    
+    if not next_node:
+        raise ValueError("Supervisor failed to determine the next step.")
 
-    # # Our team supervisor is an LLM node. It just picks the next agent to process
-    # # and decides when the work is completed
-    
-
-    # prompt = ChatPromptTemplate.from_messages(
-    #     [
-    #         ("system", system_prompt),
-    #         MessagesPlaceholder(variable_name="messages"),
-    #         (
-    #             "system",
-    #             "Given the conversation above, who should act next?"
-    #             " Or should we FINISH? Select one of: {options}",
-    #         ),
-    #     ]
-    # ).partial(options=str(options), members=", ".join(members))
-
-    # supervisor_chain = (
-    #     prompt
-    #     | llm.with_structured_output(routeResponse)
-    # )
-    # return supervisor_chain.invoke(state)
+    if next_node == "FINISH":
+        next_node = END
+    # Return a Command with the target node in the goto field.
+    return Command(goto=next_node, update={"next": next_node})
 
 def create_graph():
-    #Define resource finder agent
-    resource_finder_prompt = "You are a helpful resource finder that will search for topics in programming and computer science."
-    resource_finder_agent = create_react_agent(llm, tools=[tavily_tool], state_modifier=resource_finder_prompt)
-    resource_finder_node = functools.partial(agent_node, agent=resource_finder_agent, name="Resource-Finder")
+    workflow = StateGraph(State)
 
-    #Define problem generator agent
-    problem_prompt = "You are a coding problem generator. Use the tool to generate a coding problem based on the user's request and provide the exact answer. Do not provide any solution unless requested by the user."
-    problem_agent = create_react_agent(llm, tools=[coding_problem_generator], state_modifier=problem_prompt)
-    problem_node = functools.partial(agent_node, agent=problem_agent, name="Problem-Generator")
+    workflow.add_node("Resource-Finder", resource_finder)
+    workflow.add_node("Problem-Generator", coding_problem_generator)
+    workflow.add_node("Supervisor", supervisor_agent)
 
-    #Define grader agent
-    grader_prompt = "You are a coding grader. You will run the user's code and provide feedback on their solution based on the coding problem they were provided with such as bugs in the code, syntax/logical errors, etc. Do not overtly give the solution but guide them in the right direction unless they explicitly request a solution."
-    grader_agent = create_react_agent(llm, tools=[python_repl_tool], state_modifier=grader_prompt)
-    grader_node = functools.partial(agent_node, agent=grader_agent, name="Grader")
+    workflow.add_edge(START, "Supervisor")
 
-    # Define the workflow
-    workflow = StateGraph(MessagesState)
-    workflow.add_node("Resource-Finder", resource_finder_node)
-    workflow.add_node("Problem-Generator", problem_node)
-    workflow.add_node("Grader", grader_node)
-    workflow.add_node("supervisor", supervisor_agent)
-
-    members = ["Resource-Finder", "Problem-Generator", "Grader"]
-
-    # Add edges to the graph, starting with the supervisor
-    workflow.add_edge(START, "supervisor")
-
-    # Add edges to the graph, every worker reports back to the supervisor
-    for member in members:
-        # We want our workers to ALWAYS "report back" to the supervisor when done
-        workflow.add_edge(member, "supervisor")
-
-    # The supervisor populates the "next" field in the graph state which routes to a node or finishes
-    # conditional_map = {k: k for k in members}
-    # conditional_map["FINISH"] = END
-    # workflow.add_conditional_edges("supervisor", lambda x: x["next"], conditional_map)
-    # Finally, add entrypoint
-    
-
-    memory = MemorySaver()
-    graph = workflow.compile(checkpointer=memory)
+    graph = workflow.compile()
 
     return graph
 
 
 def main():
+    # Create the state graph
     graph = create_graph()
 
     # Print out the LangGraph as ASCII
-    # graph.get_graph().print_ascii()
+    graph.get_graph().print_ascii()
 
     # Continuous input and LLM interaction
     print(colored("You can start interacting with the coding assistant. Type 'exit' to end the conversation.", "blue"))
@@ -232,27 +208,25 @@ def main():
         user_message = input("> ")
 
         if user_message == "exit":
+            print(colored("Goodbye!", "blue"))
             break
 
-        # input_message = HumanMessage(content=user)
-        config = {"configurable": {"thread_id": "1"}}
-        # llm_output = graph.invoke(user_message, config)
-       
+        input_state = {"messages": [{"role": "user", "content": user_message}]}
+        config = {"configurable": {"thread_id": 42}}
 
-        for event in graph.stream({"messages": [user_message]}, config, subgraphs=True):
-            print(colored(event, "red"))
-            print("------------------------------------")
+        # # Verbose output
+        # for event in graph.stream(input_state, config):
+        #     print(colored(event, "red"))
+        #     print("------------------------------------")
 
-
-
-    # config = {"configurable": {"thread_id": "1"}}
-    # input_message = HumanMessage(content="I want an easy coding problem about arrays. Please give me a solution too with code.")
-    # for event in graph.stream({"messages": [input_message]}, config, stream_mode="values"):
-    #     if "__end__" not in event:
-    #         event["messages"][-1].pretty_print()
+        # Concise output
+        final_state = graph.invoke(input_state, config)
+        print(colored(final_state["messages"][-1].content, "red"))
+        print("------------------------------------")
 
 
 if __name__ == "__main__":
     main()
+ 
 
 
